@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Reference papers (copyrighted PDFs, not for redistribution)
+/action-valuation-analytics/
+/offline-rl-methods/
+/rl-tactics-strategy/
+/stroke-forecasting/
+
+# Internal working docs — not for the public repo
+/CLAUDE.md
+/docs/
