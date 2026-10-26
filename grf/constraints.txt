@@ -1,0 +1,2 @@
+# numpy 2 breaks gym 0.21 / gfootball-era code paths. Pin the whole image to 1.x.
+numpy==1.26.4

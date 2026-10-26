@@ -1,0 +1,12 @@
+# Editor type checking only (ty, the LSP in Neovim). The code runs in the container
+# (Python 3.10, gymnasium 0.29.1); ../.venv holds the same gymnasium so types resolve on the host.
+[environment]
+python = "../.venv"
+python-version = "3.10"
+
+# gymnasium types env.step()'s info as dict[str, Any]; hrl returns the Info TypedDict so that
+# info["tau"] and info["option_end"] are checked and hover. A TypedDict can't pass as a dict.
+[[overrides]]
+include = ["hrl/execution.py", "hrl/toy.py"]
+[overrides.rules]
+invalid-method-override = "ignore"

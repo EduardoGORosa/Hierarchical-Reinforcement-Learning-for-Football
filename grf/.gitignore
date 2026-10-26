@@ -1,0 +1,7 @@
+# Training output: checkpoints, tensorboard, monitor logs, episode dumps.
+runs/
+# Vendored gfootball source (91 MB); re-clone with:
+#   git clone --depth 1 https://github.com/google-research/football.git vendor/football
+vendor/
+*.png
+__pycache__/
