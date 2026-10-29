@@ -3,7 +3,7 @@
 From grf/src (host for layers 1-3 and 6-7 maths; container for everything: ./run.sh hrl check):
 
     python3 -m hrl.check                 the whole ladder, one line per node
-    python3 -m hrl.check 24              node 24: every unit test, then the stack test
+    python3 -m hrl.check 24              node 24: every unit test, then the stack test (or 37a, 37b)
     python3 -m hrl.check 24 --unit       only the unit tests (this node alone, lower nodes faked)
     python3 -m hrl.check 24 --demo       node 24's demo: predict its output first, then run it
     python3 -m hrl.check --upto 29       every node up to 29 in teaching order, units and stacks
@@ -31,21 +31,27 @@ from pathlib import Path
 
 from hrl.tests._support import Skip
 
-# Teaching order, from the build map. 41 and 42 are theory nodes, with no code.
-ORDER = [23, 24, 22, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
-         38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+# Teaching order, from the build map. 41 and 42 are theory nodes, with no code. A node with its
+# own test file and a letter (37a, test_n37a_*.py) is a string; one file shared by 30a/30b is 30.
+ORDER: list[int | str] = [23, 24, 22, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
+                          "37a", "37b", 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
 LAYERS = {1: "PPO pieces", 2: "SMDP arithmetic", 3: "options", 4: "execution (toy pitch)",
           5: "two phases (toy pitch)", 6: "style", 7: "evaluation"}
 THEORY = {41: "a constraint can be substituted away", 42: "lambda is the constraint's price"}
 
 
-def _test_modules() -> dict[int, object]:
+def _node(s: str) -> int | str:
+    """'37' -> 37, '37a' -> '37a': the key ORDER uses."""
+    return int(s) if s.isdigit() else s
+
+
+def _test_modules() -> dict[int | str, object]:
     import hrl.tests as pkg
     mods = {}
     for info in pkgutil.iter_modules(pkg.__path__):
-        m = re.match(r"test_n(\d+)_", info.name)
+        m = re.match(r"test_n(\d+[a-z]?)_", info.name)
         if m:
-            mods[int(m.group(1))] = importlib.import_module(f"hrl.tests.{info.name}")
+            mods[_node(m.group(1))] = importlib.import_module(f"hrl.tests.{info.name}")
     return mods
 
 
@@ -63,7 +69,7 @@ def _run(fn) -> tuple[str, str]:
     return "PASS", ""
 
 
-def run_node(n: int, mod, unit_only: bool = False, quiet: bool = False) -> dict:
+def run_node(n: int | str, mod, unit_only: bool = False, quiet: bool = False) -> dict:
     units = [(name, getattr(mod, name)) for name in dir(mod) if name.startswith("test_unit")]
     units.sort(key=lambda t: t[1].__code__.co_firstlineno)
     res = {"units": [(name[len("test_unit_"):] or "unit", *_run(fn)) for name, fn in units]}
@@ -140,12 +146,12 @@ def main(argv: list[str]) -> int:
         asks()
         return 0
     if "--upto" in argv:
-        n = int(argv[argv.index("--upto") + 1])
+        n = _node(argv[argv.index("--upto") + 1])
         return 1 if ladder(ORDER[:ORDER.index(n) + 1], mods, verbose=True) else 0
     if "--layer" in argv:
         k = int(argv[argv.index("--layer") + 1])
         return 1 if ladder([n for n in ORDER if n in mods and mods[n].LAYER == k], mods, True) else 0
-    nums = [int(a) for a in argv if a.isdigit()]
+    nums = [_node(a) for a in argv if re.fullmatch(r"\d+[a-z]?", a)]
     if not nums:
         return 1 if ladder(ORDER, mods, verbose=False) else 0
     for n in nums:

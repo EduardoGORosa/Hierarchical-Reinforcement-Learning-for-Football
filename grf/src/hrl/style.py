@@ -38,16 +38,16 @@ def softmax(logits: Sequence[float] | np.ndarray) -> np.ndarray:
     Subtract the largest score first. Node 33 shows why that changes nothing
     mathematically, and why it stops exp() overflowing for large scores.
     """
-    # TODO(node 38)
-    raise NotImplementedError("TODO(node 38)")
+    z = np.asarray(logits, dtype=float)
+    e = np.exp(z - z.max())
+    return e / e.sum()
 
 
 # --- node 39: the style rule --------------------------------------------------
 
 def styled_logits(logits: Sequence[float] | np.ndarray, preference: Sequence[float] | np.ndarray, lam: float) -> np.ndarray:
     """The top layer's scores after applying a style of strength lam."""
-    # TODO(node 39): one line.
-    raise NotImplementedError("TODO(node 39)")
+    return np.asarray(logits, dtype=float) + lam * np.log(np.asarray(preference, dtype=float))
 
 
 def styled_probs(trained_probs: Sequence[float] | np.ndarray, preference: Sequence[float] | np.ndarray, lam: float) -> np.ndarray:
@@ -63,8 +63,8 @@ def kl(q: Sequence[float] | np.ndarray, p: Sequence[float] | np.ndarray) -> floa
     Read it as: how surprised, on average, someone who expected p is by play
     that actually follows q.
     """
-    # TODO(node 40): one line. Assume every entry of q and p is > 0.
-    raise NotImplementedError("TODO(node 40)")
+    q, p = np.asarray(q, dtype=float), np.asarray(p, dtype=float)
+    return float(np.sum(q * np.log(q / p)))
 
 
 def style_score(q: Sequence[float] | np.ndarray, preference: Sequence[float] | np.ndarray) -> float:

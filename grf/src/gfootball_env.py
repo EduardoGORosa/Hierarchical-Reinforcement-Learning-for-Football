@@ -71,8 +71,13 @@ class GFootballEnv(gymnasium.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        if seed is not None and hasattr(self._env, "seed"):
-            self._env.seed(seed)
+        # gfootball's FootballEnv has no seed(): each reset draws the engine seed from
+        # Python's global `random` (which PPO.load reseeds), unless the config already holds
+        # one. Writing the next draw of our own np_random there makes every episode a
+        # different game that is still reproducible from `seed`.
+        self._env.unwrapped._config["game_engine_random_seed"] = int(
+            self.np_random.integers(0, 2_000_000_000)
+        )
         obs = self._env.reset()
         return self._cast(obs), {}
 

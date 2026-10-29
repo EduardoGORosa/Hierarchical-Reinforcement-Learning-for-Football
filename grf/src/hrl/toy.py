@@ -13,7 +13,8 @@ The rules, all of them:
   - the episode also ends after 100 steps, with reward 0
   - observation: (x, y) as float32
   - raw_observation(): the same keys GRF's raw observation uses for the ball, so options.py
-    can't tell the difference
+    can't tell the difference. Also one player of ours, on the ball, and their keeper alone on
+    the goal line: so "pass" and "dribble" (node 37a) can never be reached here
 
 Seeds: reset(seed=s) with x0=None starts the ball at x0 = (s % 100) / 100, so a list of seeds
 is a list of known starting positions. That's what node 45's test uses.
@@ -68,7 +69,10 @@ class KnownAnswerPitch(gymnasium.Env[np.ndarray, int]):
 
     def raw_observation(self) -> RawObs:
         return {"ball": np.array([self.x, 0.0, 0.1]), "ball_owned_team": self.owner,
-                "ball_direction": np.array([*self.dir, 0.0])}
+                "ball_direction": np.array([*self.dir, 0.0]),
+                "ball_owned_player": 0 if self.owner == O.OURS else -1,
+                "left_team": np.array([[self.x, 0.0]]),
+                "right_team": np.array([[1.0, 0.0]]), "right_team_roles": np.array([0])}
 
     def step(self, action: int) -> StepResult:
         self.t += 1

@@ -5,3 +5,4 @@ runs/
 vendor/
 *.png
 __pycache__/
+runs

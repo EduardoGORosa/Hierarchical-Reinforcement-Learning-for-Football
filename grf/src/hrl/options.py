@@ -33,13 +33,19 @@ Coordinates are GRF's raw observation: x from -1 (our goal) to +1 (theirs), y fr
 a rendered clip that NEGATIVE y is the attacking team's LEFT (GRF's action "top" moves towards
 negative y). If it isn't, swap the two wing lanes and leave the tests as they are.
 
-Checks:        python3 -m hrl.check 30      (and 31)
+Two option sets (OPTION_SETS), chosen once per process with use_option_set:
+  "zones"    the six above (nodes 30-37). Parked: on 3v1 they collapsed (thesis_ideas 3.4c).
+  "actions"  pass / dribble / shoot, subgoals that fit a ~33-step 3v1 attack (node 37a).
+The default is "zones", so every test of nodes 30-37 still sees the six.
+
+Checks:        python3 -m hrl.check 30      (and 31, 37a)
 Demo dumps:    ./run.sh hrl options         (runs every subgoal test over grf/runs/demo)
 """
 
 from __future__ import annotations
+from math import sqrt
 
-from typing import Sequence
+from typing import Sequence, cast
 
 import pickle
 import sys
@@ -47,7 +53,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from hrl.hints import Lane, RawObs, SubgoalKind, Termination, TerminationMode
+from hrl.hints import (
+    Lane,
+    OptionSetName,
+    RawObs,
+    SubgoalKind,
+    Termination,
+    TerminationMode,
+)
 
 # Scales from the engine, not from a 105 x 68 m pitch: observations are engine metres divided by
 # X_FIELD_SCALE = 54.4 and Y_FIELD_SCALE = -83.6 (gfootball_engine/src/defines.hpp:55-56).
@@ -60,11 +73,16 @@ BOX_X = 0.708  # 38.5 / 54.4
 BOX_HALF_WIDTH = 0.241  # 20.15 / 83.6
 GOAL_HALF_WIDTH = 0.044  # goal mouth, gfootball/doc/observation.md
 FORWARD_METRES = 5.0  # a lane subgoal needs this much forward progress
-HORIZON = 30  # H_o: 3 s of game time
+HORIZON = (
+    30  # H_o: 3 s of game time. use_option_set changes it to the chosen set's horizon
+)
+ACTION_HORIZON = 20  # the "actions" set's H_o, measured (node 37a): a pass takes ~14 steps, a dribble ~19
 SHOT_ACTION = 12  # "shot" in GRF's default (v1) action set
 SHOT_MIN_SPEED = 0.03  # x units per step towards their goal. Demo dumps: shots 0.037-0.068, other releases <= 0.025
 SHOT_AIM_MARGIN = 0.005  # y units past each post still counted as aimed. Demo dumps: shots aimed to |y| <= 0.0445, a firm pass to 0.052
 OPTION_REWARD = 1.0  # r_o when the subgoal is reached (Definition 3)
+SHOOT_RANGE_M = 25.0  # --initiation: shoot only from within this distance of the goal centre
+INITIATION = False  # --initiation: options.use_initiation(True) switches the initiation sets on
 
 OURS, THEIRS, NOBODY = 0, 1, -1  # values of obs["ball_owned_team"]
 
@@ -84,11 +102,22 @@ class Option:
     horizon: int = HORIZON
 
     def initiation(self, obs: RawObs) -> bool:
-        """I(s). Design Principle 2, the simplest constraint: available everywhere."""
+        """I(s). Off (the default): available everywhere, Design Principle 2's simplest constraint.
+        With use_initiation(True), an action option starts only where it can work:
+        pass with the ball, dribble with the ball and a defender to beat, shoot within SHOOT_RANGE_M."""
+        if not INITIATION or self.subgoal not in ("completed_pass", "beat_defender", "shot_released"):
+            return True
+        if not we_own_ball(obs):
+            return False
+        if self.subgoal == "beat_defender":
+            return defender_to_beat(obs) != -1
+        if self.subgoal == "shot_released":
+            dx, dy = to_metres((1.0 - float(obs["ball"][0]), float(obs["ball"][1])))
+            return sqrt(dx * dx + dy * dy) <= SHOOT_RANGE_M
         return True
 
 
-OPTIONS = (
+ZONE_OPTIONS = (
     Option(0, "left_wing", subgoal="forward_in_lane", lane="left"),
     Option(1, "centre", subgoal="forward_in_lane", lane="centre"),
     Option(2, "right_wing", subgoal="forward_in_lane", lane="right"),
@@ -96,7 +125,43 @@ OPTIONS = (
     Option(4, "shoot", subgoal="is_shot"),
     Option(5, "keep", subgoal="keep_ball"),
 )
+ACTION_OPTIONS = (  # node 37a: the styles of thesis_ideas 3.4b, one option each
+    Option(
+        0, "pass", subgoal="completed_pass", horizon=ACTION_HORIZON
+    ),  # combination play
+    Option(
+        1, "dribble", subgoal="beat_defender", horizon=ACTION_HORIZON
+    ),  # individual play
+    Option(2, "shoot", subgoal="shot_released", horizon=ACTION_HORIZON),  # direct play
+)
+OPTION_SETS: dict[
+    OptionSetName, tuple[tuple[Option, ...], int]
+] = {  # name -> (options, H_o)
+    "zones": (ZONE_OPTIONS, HORIZON),
+    "actions": (ACTION_OPTIONS, ACTION_HORIZON),
+}
+OPTIONS = ZONE_OPTIONS
 SUBGOALS = tuple(o.name for o in OPTIONS)
+
+
+def use_initiation(on: bool) -> None:
+    """Switch the action options' initiation sets on or off for this process (--initiation).
+    Like use_option_set, call it inside every SubprocVecEnv worker."""
+    global INITIATION
+    INITIATION = on
+
+
+def use_option_set(name: OptionSetName) -> None:
+    """Make `name` the option set of this process: OPTIONS, SUBGOALS and HORIZON here, and
+    OPTIONS and N_OPTIONS in hrl.execution. Call it once, before building any env (each
+    SubprocVecEnv worker is its own process, so train_hrl calls it inside every worker)."""
+    global OPTIONS, SUBGOALS, HORIZON
+    OPTIONS, HORIZON = OPTION_SETS[name]
+    SUBGOALS = tuple(o.name for o in OPTIONS)
+    execution = sys.modules.get("hrl.execution")
+    if execution is not None:
+        setattr(execution, "OPTIONS", OPTIONS)
+        setattr(execution, "N_OPTIONS", len(OPTIONS))
 
 
 @dataclass
@@ -108,6 +173,9 @@ class OptionStart:
     step: int  # the environment step it started on
     ball_x: (
         float  # the ball's x when it started; lane subgoals measure progress from here
+    )
+    raw: RawObs | None = (
+        None  # the whole raw frame when it started: pass and dribble read it
     )
 
 
@@ -150,7 +218,7 @@ def is_shot(prev_obs: RawObs, obs: RawObs, action: int | None = None) -> bool:
         obs["ball"][1],
     )
 
-    if prev_obs["ball_owned_team"] == OURS and action is SHOT_ACTION:
+    if prev_obs["ball_owned_team"] == OURS and action == SHOT_ACTION:
         return True
     elif (
         prev_obs["ball_owned_team"] == OURS
@@ -192,6 +260,88 @@ def keep_ball(obs: RawObs, steps_run: int, steps_needed: int) -> bool:
     return we_own_ball(obs) and steps_needed <= steps_run
 
 
+# --- node 37a: subgoals that fit a 3v1 attack -----------------------------------
+
+
+def closeness_to_ball(player, ball):
+    return np.sqrt(
+        np.square(abs(player[0] - ball[0]) * X_METRES)
+        + np.square(abs(player[1] - ball[1]) * Y_METRES)
+    )
+
+
+def carrier(obs: RawObs) -> int:
+    """Index in obs["left_team"] of the player whose ball it is: ball_owned_player when we own
+    it, otherwise our player nearest the ball, in metres."""
+
+    if we_own_ball(obs):
+        return obs["ball_owned_player"]
+
+    best_distance = float("inf")
+    carrier_index = 0
+
+    ball = obs["ball"][:-1]
+    for i, player in enumerate(obs["left_team"]):
+        distance = closeness_to_ball(player, ball)
+        if distance < best_distance:
+            best_distance = distance
+            carrier_index = i
+
+    return carrier_index
+
+
+def completed_pass(start_obs: RawObs, obs: RawObs) -> bool:
+    """We own the ball now, and the player who has it is not carrier(start_obs)."""
+    return we_own_ball(obs) and carrier(start_obs) != carrier(obs)
+
+
+def defender_to_beat(start_obs: RawObs) -> int:
+    """Index in obs["right_team"] of the defender this option has to beat: of the opponents
+    in front of the ball (x greater than the ball's x) who are not the goalkeeper
+    (right_team_roles 0), the nearest to the ball in metres. -1 if there is none."""
+
+    opponent_index = -1  # no defender yet
+    best_distance = float("inf")
+
+    ball = start_obs["ball"][:-1]
+    for i, opponent in enumerate(start_obs["right_team"]):
+        if start_obs["right_team_roles"][i] == 0:  # the keeper, at any index
+            continue
+        if opponent[0] <= ball[0]:  # behind the ball
+            continue
+        distance = closeness_to_ball(opponent, ball)
+        if distance < best_distance:
+            best_distance = distance
+            opponent_index = i
+
+    return opponent_index
+
+
+def beat_defender(start_obs: RawObs, obs: RawObs) -> bool:
+    """carrier(start_obs) still has the ball (we own it and it's his), and the ball is past
+    the defender: ball x greater than defender_to_beat(start_obs)'s x NOW. False if there
+    was no defender to beat."""
+    # TODO(node 37a): subgoal_reached calls this for option "dribble". Use the defender's
+    #   position on THIS frame: he runs back, and the ball has to get past where he is, not
+    #   where he was. If a pass counts here (another player has the ball), dribble and pass
+    #   pay for the same thing.
+    if defender_to_beat(start_obs) == -1:
+        return False
+
+    return (
+        we_own_ball(obs)
+        and carrier(start_obs) == carrier(obs)
+        and obs["right_team"][defender_to_beat(start_obs)][0] < obs["ball"][0]
+    )
+
+
+def shot_released(prev_obs: RawObs, obs: RawObs) -> bool:
+    """is_shot read from the ball's flight only (no action): the ball has to leave the foot.
+    Provided. With the button counted, holding `shot` while still on the ball paid every step:
+    17-20 "shots" per episode and no goals in a 500k-step run (node 37b)."""
+    return is_shot(prev_obs, obs)
+
+
 def subgoal_reached(
     start: OptionStart,
     prev_obs: RawObs,
@@ -212,6 +362,14 @@ def subgoal_reached(
             return is_shot(prev_obs, obs, action)
         case "keep_ball":
             return keep_ball(obs, step - start.step, option.horizon)
+        case "completed_pass":
+            assert start.raw is not None, "OptionStart needs the start frame (raw=...)"
+            return completed_pass(start.raw, obs)
+        case "beat_defender":
+            assert start.raw is not None, "OptionStart needs the start frame (raw=...)"
+            return beat_defender(start.raw, obs)
+        case "shot_released":
+            return shot_released(prev_obs, obs)
 
 
 def option_reward(
@@ -282,18 +440,22 @@ def replay_option(frames: list[RawObs], z: int) -> list[tuple[int, int, Terminat
     """Run option z over a recorded episode, restarting it each time it ends. Returns
     (start_step, end_step, reason) for each run. This is thesis_ideas 6.2: do the tests fire
     when your eye says they should?"""
-    runs, start = [], OptionStart(z, 0, float(frames[0]["ball"][0]))
+    runs, start = [], OptionStart(z, 0, float(frames[0]["ball"][0]), frames[0])
     for t in range(1, len(frames)):
         reason = termination(
             start, frames[t - 1], frames[t], t, done=t == len(frames) - 1
         )
         if reason:
             runs.append((start.step, t, reason))
-            start = OptionStart(z, t, float(frames[t]["ball"][0]))
+            start = OptionStart(z, t, float(frames[t]["ball"][0]), frames[t])
     return runs
 
 
 def main(argv: list[str]) -> int:
+    if "--option-set" in argv:
+        i = argv.index("--option-set")
+        use_option_set(cast(OptionSetName, argv[i + 1]))
+        argv = argv[:i] + argv[i + 2 :]
     root = Path(argv[0] if argv else "/work/runs/demo")
     for dump in sorted(root.glob("*/*.dump")):
         frames = load_dump(dump)

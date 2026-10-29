@@ -21,14 +21,24 @@ Klissarov et al. 2025 (arXiv:2506.14045), Algorithm 1 and section 8.1:
     python3 -m hrl.train_hrl mu --level academy_3_vs_1_with_keeper --rewards scoring \
         --timesteps 1000000 --option-policy /work/runs/<options run>/final_model.zip
 
+The 3v1 option set (nodes 37a-37b), then diagnose.py before phase mu:
+
+    python3 -m hrl.train_hrl options --level academy_3_vs_1_with_keeper --rewards scoring \
+        --option-set actions --option-returns --reward-mix both --option-reward-weight 1.0 \
+        --timesteps 2000000
+    python3 -m hrl.diagnose /work/runs/<options run>
+    python3 -m hrl.train_hrl mu ... --option-set actions --option-policy ...
+
 PPO arguments are train_ppo.py's, with the same defaults (Kurach et al. 2019). Use
 --rewards scoring: the checkpoint reward is not potential-based (brief, trap 5).
 
 Each survey choice is a flag, so it can be reported and varied:
+  --option-set {zones,actions}        which options exist (options.OPTION_SETS; node 37a)
   --reward-mix {option,both,env}      survey 8.3, execution.combine_rewards
   --option-reward-weight              the weight for "both"
   --termination {clock,geometric}     survey Design Principle 2, options.termination
   --with-primitives                   mu over options AND primitives (survey 3.2.1 and 2.2)
+  --option-returns                    phase options: each option's return stops where it ends
 
 Budget accounting (node 11): in phase `mu`, model.num_timesteps counts DECISIONS. The env
 steps are the sum of tau, logged as hrl/env_steps. Learning curves must use env steps. A tiny
@@ -93,9 +103,10 @@ def _smdp_classes():
         """Copies info["tau"] into the buffer slot about to be written.
         (SB3 2.4 calls on_step() just before rollout_buffer.add().)"""
 
-        def __init__(self):
+        def __init__(self, max_env_steps: int = 0):
             super().__init__()
             self.env_steps = 0
+            self.max_env_steps = max_env_steps
 
         def _on_step(self) -> bool:
             buf = self.model.rollout_buffer
@@ -103,20 +114,72 @@ def _smdp_classes():
             buf.taus[buf.pos] = taus
             self.env_steps += sum(taus)
             self.logger.record("hrl/env_steps", self.env_steps)
-            return True
+            # mu's budget is counted in decisions; this stops it on an env-step budget instead.
+            return not (self.max_env_steps and self.env_steps >= self.max_env_steps)
 
     return SMDPRolloutBuffer, RecordTau
+
+
+def _option_return_classes():
+    """--option-returns: phase `options` with each option's return cut where the option ends.
+    Without it, PPO's returns run on past beta into the NEXT options' rewards, so pi is paid for
+    setting up later subgoals (node 37b: pi passed forever and stopped scoring)."""
+    from stable_baselines3.common.callbacks import BaseCallback
+    SMDPRolloutBuffer, _ = _smdp_classes()
+
+    class OptionReturnBuffer(SMDPRolloutBuffer):
+        """smdp_gae with every tau = 1 (plain GAE, node 29b), and an option's end treated as
+        the end of its return, like an episode's end."""
+
+        def reset(self):
+            super().reset()
+            self.option_ends = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+
+        def compute_returns_and_advantage(self, last_values, dones):
+            dones = np.maximum(dones, self.option_ends[-1])
+            saved, self.episode_starts = self.episode_starts, self.episode_starts.copy()
+            self.episode_starts[1:] = np.maximum(self.episode_starts[1:], self.option_ends[:-1])
+            super().compute_returns_and_advantage(last_values, dones)
+            self.episode_starts = saved
+
+    class RecordOptionEnd(BaseCallback):
+        """Copies "did an option end on this step" into the buffer slot about to be written."""
+
+        def _on_step(self) -> bool:
+            buf = self.model.rollout_buffer
+            buf.option_ends[buf.pos] = [info.get("option_end") is not None for info in self.locals["infos"]]
+            return True
+
+    return OptionReturnBuffer, RecordOptionEnd
 
 
 def main() -> int:
     p = build_parser()
     p.add_argument("phase", choices=["options", "mu"])
+    p.add_argument("--option-set", default="zones", choices=["zones", "actions"])
     p.add_argument("--reward-mix", default="both", choices=["option", "both", "env"])
     p.add_argument("--option-reward-weight", type=float, default=0.1)
     p.add_argument("--termination", default="clock", choices=["clock", "geometric"])
     p.add_argument("--with-primitives", action="store_true")
+    p.add_argument("--option-returns", action="store_true",
+                   help="phase options: cut each option's return where it ends (node 37b)")
     p.add_argument("--option-policy", help="phase-`options` model zip (required for `mu`)")
+    p.add_argument("--deliberation-cost", type=float, default=0.0,
+                   help="phase mu: subtracted from mu's reward once per decision (Harb et al. 2018)")
+    p.add_argument("--max-env-steps", type=int, default=0,
+                   help="phase mu: stop once this many environment steps are used (0 = stop on --timesteps only)")
+    p.add_argument("--initiation", action="store_true",
+                   help="both phases: options start only where their initiation set I(s) holds (options.Option.initiation)")
+    p.add_argument("--end-value-from", default=None,
+                   help="phase options: a trained mu zip; an option that ends also earns that mu's V(end state)")
+    p.add_argument("--end-value-weight", type=float, default=1.0, help="scales --end-value-from")
+    p.add_argument("--style-input", action="store_true",
+                   help="phase mu: mu sees a style w (Dirichlet per episode) and earns --style-bonus x w[z] when z is reached")
+    p.add_argument("--style-bonus", type=float, default=0.3)
+    p.add_argument("--style-alpha", type=float, default=1.0, help="Dirichlet concentration for w (1 = uniform over styles)")
     args = p.parse_args()
+    assert not (args.initiation and args.phase == "mu" and not args.with_primitives), \
+        "--initiation in phase mu needs --with-primitives: 3v1 starts on a loose ball, where no option can start"
 
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
@@ -130,7 +193,10 @@ def main() -> int:
         def _init():
             sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
             from gfootball_env import GFootballEnv
-            from hrl.execution import OptionLearningEnv, SMDPEnv
+            from hrl.execution import OptionLearningEnv, SMDPEnv, StyleConditionedEnv
+            from hrl.options import use_initiation, use_option_set
+            use_option_set(args.option_set)              # node 37a: this worker's options
+            use_initiation(args.initiation)
             if args.level == "toy":                      # node 37: the known-answer pitch
                 from hrl.toy import KnownAnswerPitch
                 base = KnownAnswerPitch(x0=0.0)
@@ -138,25 +204,48 @@ def main() -> int:
                 base = GFootballEnv(env_name=args.level, representation=args.representation, rewards=args.rewards)
             rng = np.random.default_rng(args.seed + rank)
             if args.phase == "options":
-                env = OptionLearningEnv(base, args.reward_mix, args.option_reward_weight, args.termination, rng)
+                end_value = None
+                if args.end_value_from:
+                    import torch
+                    mu = PPO.load(args.end_value_from, device="cpu")
+
+                    def end_value(o):
+                        with torch.no_grad():
+                            return float(mu.policy.predict_values(torch.as_tensor(o[None], dtype=torch.float32))[0, 0])
+                env = OptionLearningEnv(base, args.reward_mix, args.option_reward_weight, args.termination, rng,
+                                        end_value=end_value, end_value_weight=args.end_value_weight)
             else:
                 pi = PPO.load(args.option_policy, device="cpu")
                 env = SMDPEnv(base, lambda o: int(pi.predict(o, deterministic=False)[0]), args.gamma,
-                              args.with_primitives, args.termination, rng=rng)
+                              args.with_primitives, args.termination, rng=rng,
+                              deliberation_cost=args.deliberation_cost)
+                if args.style_input:
+                    env = StyleConditionedEnv(env, args.style_bonus, args.style_alpha, rng=rng)
             env.reset(seed=args.seed + rank)
             return env
         return _init
 
+    # Phase mu: also log the game's own reward per episode, so goals stay countable when a
+    # deliberation cost makes the monitored reward negative.
     venv = VecMonitor(SubprocVecEnv([make_env(i) for i in range(args.n_envs)], start_method="spawn"),
-                      filename=str(run_dir / "monitor.csv"))
+                      filename=str(run_dir / "monitor.csv"),
+                      info_keywords=("episode_env_reward",) if args.phase == "mu" else ())
     kwargs, callbacks = _ppo_kwargs(args), None
+    if args.phase == "options" and args.option_returns:
+        OptionReturnBuffer, RecordOptionEnd = _option_return_classes()
+        kwargs["rollout_buffer_class"] = OptionReturnBuffer
+        callbacks = [RecordOptionEnd()]
     if args.phase == "mu":
         assert args.option_policy, "--option-policy is required for phase mu"
         SMDPRolloutBuffer, RecordTau = _smdp_classes()
         kwargs["rollout_buffer_class"] = SMDPRolloutBuffer
-        callbacks = [RecordTau()]
+        callbacks = [RecordTau(args.max_env_steps)]
 
     model = PPO("MlpPolicy", venv, tensorboard_log=str(run_dir / "tb"), **kwargs)
+    if args.init_from:
+        # Weights only, into the model built above, so this run's buffer class and callbacks stay.
+        # A cost from scratch collapses mu before it learns to score (dense cost, sparse goals).
+        model.set_parameters(args.init_from, exact_match=True, device="cpu")
     try:
         model.learn(total_timesteps=args.timesteps, callback=callbacks)
     finally:

@@ -13,6 +13,8 @@ venv/
 /offline-rl-methods/
 /rl-tactics-strategy/
 /stroke-forecasting/
+/grf_papers/
+/hrl/
 
 # Internal working docs — not for the public repo
 /CLAUDE.md

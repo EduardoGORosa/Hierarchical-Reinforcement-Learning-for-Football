@@ -54,7 +54,7 @@ from hrl.hints import (
     TerminationMode,
 )
 
-N_OPTIONS = len(OPTIONS)
+N_OPTIONS = len(OPTIONS)  # OPTIONS and N_OPTIONS follow options.use_option_set
 N_PRIMITIVES = 19
 REWARD_MIXES = ("option", "both", "env")
 
@@ -64,8 +64,8 @@ def raw_frame(env: gymnasium.Env[np.ndarray, int]) -> RawObs:
     return cast(RawSource, env.unwrapped).raw_observation()
 
 
-def one_hot(z: int, n: int = N_OPTIONS) -> np.ndarray:
-    v = np.zeros(n, dtype=np.float32)
+def one_hot(z: int, n: int | None = None) -> np.ndarray:
+    v = np.zeros(N_OPTIONS if n is None else n, dtype=np.float32)
     v[z] = 1.0
     return v
 
@@ -98,9 +98,6 @@ def combine_rewards(
 def interrupt_by_advantage(q_so: float, v_s: float) -> bool:
     """Sutton, Precup & Singh's criterion: stop option o in state s when continuing it is
     worth less than choosing afresh."""
-    # TODO(node 35): True means "stop now". q_so is the value of carrying on with the running
-    #   option from s, v_s the value of letting mu choose again from s. On a tie, carrying on
-    #   costs nothing, so the option keeps running. SMDPEnv's should_interrupt calls this.
     return q_so < v_s
 
 
@@ -114,16 +111,9 @@ def action_meaning(a: int, with_primitives: bool) -> tuple[ActionKind, int]:
     N_OPTIONS .. N_OPTIONS+N_PRIMITIVES-1   -> ("primitive", k)     GRF action k, one step
     Anything else, or a primitive when with_primitives is False, is a bug: raise ValueError.
     """
-    # TODO(node 36): SMDPEnv.step reads the pair: ("option", z) runs option z through the loop,
-    #   ("primitive", k) sends GRF action k to the game for one step (tau = 1). A number outside
-    #   mu's menu means the action space and this table disagree: raise ValueError, or mu
-    #   silently plays something it never chose.
-    print(a, N_OPTIONS - 1, N_OPTIONS + N_PRIMITIVES - 1)
     if a >= 0 and a <= N_OPTIONS - 1:
-        print("option", a)
         return ("option", a)
     elif a >= N_OPTIONS and a <= N_OPTIONS + N_PRIMITIVES - 1 and with_primitives:
-        print("primitive", a - N_OPTIONS)
         return ("primitive", a - N_OPTIONS)
 
     raise ValueError
@@ -152,6 +142,10 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
     """Draws each new z, and flips the coin in geometric mode."""
     log: list[tuple[str, str, int]]
     """(option, reason, duration) for every option that ended: the key debug table."""
+    end_value: Callable[[np.ndarray], float] | None
+    """--end-value-from: a trained mu's V(s), paid when an option ends. None leaves rewards as in node 33."""
+    end_value_weight: float
+    """Scales end_value."""
     start: OptionStart
     """The running option: its z, and the clock and ball x when it began."""
     t: int
@@ -166,6 +160,8 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
         weight: float = 0.1,
         termination_mode: TerminationMode = "clock",
         rng: np.random.Generator | None = None,
+        end_value: Callable[[np.ndarray], float] | None = None,
+        end_value_weight: float = 1.0,
     ) -> None:
         super().__init__(env)
         assert mix in REWARD_MIXES
@@ -181,11 +177,16 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
         self.mix, self.weight, self.termination_mode = mix, weight, termination_mode
         self.rng = rng or np.random.default_rng()
         self.log = []
+        self.end_value, self.end_value_weight = end_value, end_value_weight
 
     def _start(self, raw: RawObs) -> None:
-        self.start = OptionStart(
-            int(self.rng.integers(N_OPTIONS)), self.t, float(raw["ball"][0])
-        )
+        from hrl import options as O
+        if O.INITIATION:  # --initiation: draw only options whose I(s) holds; all of them if none does
+            ok = [o.z for o in OPTIONS if o.initiation(raw)]
+            z = int(self.rng.choice(ok)) if ok else int(self.rng.integers(N_OPTIONS))
+        else:
+            z = int(self.rng.integers(N_OPTIONS))
+        self.start = OptionStart(z, self.t, float(raw["ball"][0]), raw)
 
     def _obs(self, base_obs: np.ndarray) -> np.ndarray:
         return np.concatenate([base_obs, one_hot(self.start.z)]).astype(np.float32)
@@ -221,6 +222,11 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
                 self._start(raw)
 
         r_combined = combine_rewards(r_env, r_o, self.mix, self.weight)
+        if end and self.end_value is not None and not (terminated or truncated):
+            # Reward-respecting option (Sutton et al. 2023): at its end, the option also earns what
+            # the state it leaves is worth to a trained mu. With --option-returns this is the only
+            # route by which the rest of the attack reaches the option's return.
+            r_combined += self.end_value_weight * self.end_value(base_obs)
 
         return (
             self._obs(base_obs),
@@ -237,11 +243,13 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
 class SMDPEnv(gymnasium.Env[np.ndarray, int]):
     """The data mu learns from: one step() here is one whole option (call-and-return, 7.1.1).
 
-    action      z in 0..5 runs option z through the frozen option policy until beta.
-                With with_primitives, 6..24 runs primitive action (a - 6) for one step.
+    action      z in 0..N_OPTIONS-1 (0..5 for the zone set) runs option z through the frozen option policy until beta.
+                With with_primitives, N_OPTIONS.. runs primitive action (a - N_OPTIONS) for one step.
     reward      smdp.option_return of the ENVIRONMENT rewards during the option, with no
-                option reward: mu is paid by the task only
+                option reward: mu is paid by the task only, minus deliberation_cost per decision
     info["tau"] how many environment steps it took; the trainer discounts by gamma^tau
+    deliberation_cost  charged once per decision (Harb et al. 2018). An option that runs 20 steps
+                pays it once; 20 primitives pay it 20 times, so mu stops collapsing to primitives.
     should_interrupt(base_obs, z) -> bool, checked every `interrupt_every` steps if given.
                 Leave it None for call-and-return. The theorem covers fixed options and mu,
                 so use it for evaluation, not for training.
@@ -250,7 +258,7 @@ class SMDPEnv(gymnasium.Env[np.ndarray, int]):
     observation_space: gymnasium.spaces.Space[np.ndarray]
     """The game's own: mu sees the same observation the game gives."""
     action_space: gymnasium.spaces.Discrete
-    """One number per option (0..5), then one per primitive if with_primitives."""
+    """One number per option (0..N_OPTIONS-1), then one per primitive if with_primitives."""
     env: gymnasium.Env[np.ndarray, int]
     """The game underneath: the toy pitch or GRF. Its step() is ONE environment step."""
     pi: Policy
@@ -267,6 +275,10 @@ class SMDPEnv(gymnasium.Env[np.ndarray, int]):
     """Ask should_interrupt every this many steps."""
     rng: np.random.Generator
     """Flips the coin in geometric mode."""
+    deliberation_cost: float
+    """Subtracted from mu's reward once per decision, option or primitive. 0 is the plain SMDP."""
+    _episode_env_reward: float
+    """The game's rewards since reset, before any cost: reported in info for logging goals."""
     _obs: np.ndarray
     """The latest observation: what pi sees next, and what mu gets back."""
     _t: int
@@ -282,11 +294,14 @@ class SMDPEnv(gymnasium.Env[np.ndarray, int]):
         should_interrupt: Callable[[np.ndarray, int], bool] | None = None,
         interrupt_every: int = 1,
         rng: np.random.Generator | None = None,
+        deliberation_cost: float = 0.0,
     ) -> None:
         self.env, self.pi, self.gamma = env, option_policy, gamma
         self.with_primitives, self.termination_mode = with_primitives, termination_mode
         self.should_interrupt, self.interrupt_every = should_interrupt, interrupt_every
         self.rng = rng or np.random.default_rng()
+        self.deliberation_cost = deliberation_cost
+        self._episode_env_reward = 0.0
         self.observation_space = env.observation_space
         self.action_space = gymnasium.spaces.Discrete(
             N_OPTIONS + (N_PRIMITIVES if with_primitives else 0)
@@ -297,6 +312,7 @@ class SMDPEnv(gymnasium.Env[np.ndarray, int]):
     ) -> tuple[np.ndarray, dict[str, Any]]:
         self._obs, info = self.env.reset(seed=seed, options=options)
         self._t = 0
+        self._episode_env_reward = 0.0
         return self._obs, info
 
     def step(self, a: int) -> StepResult:
@@ -307,15 +323,29 @@ class SMDPEnv(gymnasium.Env[np.ndarray, int]):
         if kind == "primitive":  # one step, tau = 1
             self._obs, r, terminated, truncated, info = self.env.step(a)
             self._t += 1
+            self._episode_env_reward += float(r)
             return (
                 self._obs,
-                float(r),
+                float(r) - self.deliberation_cost,
                 terminated,
                 truncated,
-                Info(**info, tau=1, option_end="primitive"),
+                Info(**info, tau=1, option_end="primitive", env_reward=float(r),
+                     episode_env_reward=self._episode_env_reward),
             )
         prev = raw_frame(self.env)
-        start = OptionStart(a, self._t, float(prev["ball"][0]))
+        if not OPTIONS[a].initiation(prev):  # --initiation: mu chose an option that cannot start here
+            self._obs, r, terminated, truncated, info = self.env.step(0)  # one idle step
+            self._t += 1
+            self._episode_env_reward += float(r)
+            return (
+                self._obs,
+                float(r) - self.deliberation_cost,
+                terminated,
+                truncated,
+                Info(**info, tau=1, option_end="unavailable", env_reward=float(r),
+                     episode_env_reward=self._episode_env_reward),
+            )
+        start = OptionStart(a, self._t, float(prev["ball"][0]), prev)
         rewards, reason, terminated, truncated, info = [], None, False, False, {}
         while True:
             action = self.pi(np.concatenate([self._obs, one_hot(a)]))
@@ -347,11 +377,60 @@ class SMDPEnv(gymnasium.Env[np.ndarray, int]):
                 break
 
         r_o = option_return(rewards, self.gamma)
+        self._episode_env_reward += float(sum(rewards))
 
         return (
             self._obs,
-            r_o,
+            r_o - self.deliberation_cost,
             terminated,
             truncated,
-            Info(**info, tau=tau, option_end=reason),
+            Info(**info, tau=tau, option_end=reason, env_reward=float(sum(rewards)),
+                 episode_env_reward=self._episode_env_reward),
         )
+
+
+# --- style weights as mu's input (MORL-inspired, --style-input) ------------------------
+
+
+class StyleConditionedEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
+    """mu sees a style w (one weight per option) and is paid for playing it (Abels et al. 2019).
+
+    observation = [base observation, w]          w is drawn at reset: Dirichlet(alpha, ..., alpha)
+    reward      = SMDPEnv's reward + bonus * w[z] when option z ended "reached"
+    set_style(w) fixes w (evaluation, a chosen style); set_style(None) draws it again at every reset.
+    """
+
+    def __init__(self, env: SMDPEnv, bonus: float = 0.3, alpha: float = 1.0,
+                 rng: np.random.Generator | None = None) -> None:
+        super().__init__(env)
+        base = env.observation_space
+        assert isinstance(base, gymnasium.spaces.Box), "w is appended to a Box observation"
+        self.observation_space = gymnasium.spaces.Box(
+            low=np.concatenate([base.low, np.zeros(N_OPTIONS)]).astype(np.float32),
+            high=np.concatenate([base.high, np.ones(N_OPTIONS)]).astype(np.float32),
+            dtype=np.float32,
+        )
+        self.bonus, self.alpha = bonus, alpha
+        self.rng = rng or np.random.default_rng()
+        self.fixed: np.ndarray | None = None
+        self.w = np.full(N_OPTIONS, 1.0 / N_OPTIONS, dtype=np.float32)
+
+    def set_style(self, w: np.ndarray | None) -> None:
+        self.fixed = None if w is None else np.asarray(w, dtype=np.float32) / float(np.sum(w))
+
+    def _obs(self, base_obs: np.ndarray) -> np.ndarray:
+        return np.concatenate([base_obs, self.w]).astype(np.float32)
+
+    def reset(self, **kwargs: Any) -> tuple[np.ndarray, dict[str, Any]]:
+        base_obs, info = self.env.reset(**kwargs)
+        self.w = self.fixed if self.fixed is not None else self.rng.dirichlet(
+            np.full(N_OPTIONS, self.alpha)).astype(np.float32)
+        return self._obs(base_obs), info
+
+    def step(self, action: int) -> StepResult:
+        base_obs, r, terminated, truncated, info = self.env.step(action)
+        a = int(action)
+        extra = self.bonus * float(self.w[a]) if a < N_OPTIONS and info.get("option_end") == "reached" else 0.0
+        info["style_bonus"] = extra
+        return self._obs(base_obs), float(r) + extra, terminated, truncated, info
+

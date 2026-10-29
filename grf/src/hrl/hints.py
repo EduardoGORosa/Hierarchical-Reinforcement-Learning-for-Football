@@ -11,10 +11,16 @@ import numpy as np
 Lane = Literal["left", "centre", "right"]
 Termination = Literal["reached", "failed", "timeout"]
 """What beta returns (options.termination, node 31)."""
-OptionEnd = Literal["reached", "failed", "timeout", "interrupted", "primitive"]
+OptionEnd = Literal["reached", "failed", "timeout", "interrupted", "primitive", "unavailable"]
 ActionKind = Literal["option", "primitive"]
-SubgoalKind = Literal["forward_in_lane", "ball_in_box", "is_shot", "keep_ball"]
+SubgoalKind = Literal[
+    "forward_in_lane", "ball_in_box", "is_shot", "keep_ball", "completed_pass", "beat_defender",
+    "shot_released",
+]
 """Which test ends an option as reached: the options.py function of the same name."""
+OptionSetName = Literal["zones", "actions"]
+"""Which options exist (options.OPTION_SETS): "zones" the six pitch-zone options (nodes 30-37),
+"actions" pass / dribble / shoot (node 37a)."""
 
 # --- the dicts ----------------------------------------------------------------------------
 
@@ -71,7 +77,42 @@ class Info(TypedDict, total=False):
     option_end: OptionEnd
     score_reward: float
     """GRF: the goals-only part of the reward."""
+    style_bonus: float
+    """StyleConditionedEnv: the style reward added to this decision (style_bonus x w[z] when z reached its subgoal)."""
+    env_reward: float
+    """SMDPEnv: the game's rewards during this decision, summed undiscounted, before the deliberation cost."""
+    episode_env_reward: float
+    """SMDPEnv: env_reward summed since reset. VecMonitor logs it, so goals stay countable under a cost."""
     dumps: list[Any]
+
+
+class OptionRow(TypedDict):
+    """One option's line in the diagnostic (diagnose.py, node 37b). Fractions are of its runs."""
+
+    name: str
+    reached: float
+    """Runs that ended with its own subgoal reached."""
+    failed: float
+    """Runs that ended because the attack ended or they won the ball."""
+    timeout: float
+    """Runs that hit the clock (HORIZON steps)."""
+    reached_per_episode: float
+    goal_rate: float
+    """Episodes with a goal, with this z forced for the whole episode."""
+
+
+class DiagnosticReport(TypedDict):
+    """What diagnose.py measures for one trained option policy (node 37b)."""
+
+    option_set: str
+    episodes: int
+    """Episodes played per option."""
+    options: list[OptionRow]
+    argmax_change: float
+    """Fraction of visited states where pi's most likely action changes with z."""
+    max_tv: float
+    """Mean over states of the largest total-variation distance between pi(. | s, z) for two z."""
+    n_states: int
 
 
 # --- environment step and policy --------------------------------------------------------------

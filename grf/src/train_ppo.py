@@ -58,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     run.add_argument("--checkpoint-freq", type=int, default=0,
                      help="save every N steps (0 = only at the end)")
+    run.add_argument("--init-from", default=None,
+                     help="start from this model zip's weights instead of random ones (continue a run)")
     return p
 
 
@@ -136,6 +138,10 @@ def main() -> int:
         verbose=1,
         tensorboard_log=str(run_dir / "tb"),
     )
+    if args.init_from:
+        # Weights only (policy and optimizer); the run's own settings above still apply.
+        model.set_parameters(args.init_from, exact_match=True, device=device)
+        print(f"[config] initialised from {args.init_from}")
 
     callbacks = []
     if args.checkpoint_freq > 0:
