@@ -105,7 +105,7 @@ class Option:
         """I(s). Off (the default): available everywhere, Design Principle 2's simplest constraint.
         With use_initiation(True), an action option starts only where it can work:
         pass with the ball, dribble with the ball and a defender to beat, shoot within SHOOT_RANGE_M."""
-        if not INITIATION or self.subgoal not in ("completed_pass", "beat_defender", "shot_released"):
+        if not INITIATION or self.subgoal not in ("completed_pass", "beat_defender", "shot_released"):  # targeted set: no I(s)
             return True
         if not we_own_ball(obs):
             return False
@@ -134,11 +134,20 @@ ACTION_OPTIONS = (  # node 37a: the styles of thesis_ideas 3.4b, one option each
     ),  # individual play
     Option(2, "shoot", subgoal="shot_released", horizon=ACTION_HORIZON),  # direct play
 )
+TARGETED_OPTIONS = (  # variation 2 (2026-10-29): dribble split by where it carries the ball
+    Option(0, "pass", subgoal="completed_pass", horizon=ACTION_HORIZON),
+    Option(1, "carry_left", subgoal="carry_to_lane", lane="left", horizon=ACTION_HORIZON),
+    Option(2, "carry_centre", subgoal="carry_to_lane", lane="centre", horizon=ACTION_HORIZON),
+    Option(3, "carry_right", subgoal="carry_to_lane", lane="right", horizon=ACTION_HORIZON),
+    Option(4, "carry_box", subgoal="carry_to_box", horizon=ACTION_HORIZON),
+    Option(5, "shoot", subgoal="shot_released", horizon=ACTION_HORIZON),
+)
 OPTION_SETS: dict[
     OptionSetName, tuple[tuple[Option, ...], int]
 ] = {  # name -> (options, H_o)
     "zones": (ZONE_OPTIONS, HORIZON),
     "actions": (ACTION_OPTIONS, ACTION_HORIZON),
+    "targeted": (TARGETED_OPTIONS, ACTION_HORIZON),
 }
 OPTIONS = ZONE_OPTIONS
 SUBGOALS = tuple(o.name for o in OPTIONS)
@@ -335,6 +344,22 @@ def beat_defender(start_obs: RawObs, obs: RawObs) -> bool:
     )
 
 
+def carry_to_lane(start_obs: RawObs, obs: RawObs, lane_name: Lane) -> bool:
+    """Variation 2: carrier(start_obs) still has the ball, it is in `lane_name`, and it is at least
+    FORWARD_METRES further forward than at the start. The same player, so a pass never counts."""
+    return (
+        we_own_ball(obs)
+        and carrier(start_obs) == carrier(obs)
+        and lane(float(obs["ball"][1])) == lane_name
+        and (float(obs["ball"][0]) - float(start_obs["ball"][0])) * X_METRES >= FORWARD_METRES
+    )
+
+
+def carry_to_box(start_obs: RawObs, obs: RawObs) -> bool:
+    """Variation 2: carrier(start_obs) still has the ball and it is inside the penalty area."""
+    return carrier(start_obs) == carrier(obs) and ball_in_box(obs)
+
+
 def shot_released(prev_obs: RawObs, obs: RawObs) -> bool:
     """is_shot read from the ball's flight only (no action): the ball has to leave the foot.
     Provided. With the button counted, holding `shot` while still on the ball paid every step:
@@ -370,6 +395,12 @@ def subgoal_reached(
             return beat_defender(start.raw, obs)
         case "shot_released":
             return shot_released(prev_obs, obs)
+        case "carry_to_lane":
+            assert start.raw is not None and option.lane is not None
+            return carry_to_lane(start.raw, obs, option.lane)
+        case "carry_to_box":
+            assert start.raw is not None
+            return carry_to_box(start.raw, obs)
 
 
 def option_reward(

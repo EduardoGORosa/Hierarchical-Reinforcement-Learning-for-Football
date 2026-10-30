@@ -26,9 +26,18 @@ fi
 TTY_ARGS=()
 [ -t 0 ] && TTY_ARGS=(-it)
 
+# Custom scenarios (grf/scenarios/*.py) are mounted into gfootball's own scenarios package, so
+# --level <file name> finds them. DOCKER_EXTRA adds flags, e.g. DOCKER_EXTRA="--cpu-shares=256"
+# runs a job at lower CPU priority than the default 1024.
+SCENARIO_ARGS=()
+for f in "$HERE"/scenarios/*.py; do
+  [ -e "$f" ] && SCENARIO_ARGS+=(-v "$f:/usr/local/lib/python3.10/dist-packages/gfootball/scenarios/$(basename "$f"):ro")
+done
+read -r -a EXTRA_ARGS <<< "${DOCKER_EXTRA:-}"
+
 docker_run() {
   docker run --rm "${TTY_ARGS[@]}" \
-    "${GPU_ARGS[@]}" \
+    "${GPU_ARGS[@]}" "${SCENARIO_ARGS[@]}" "${EXTRA_ARGS[@]}" \
     --shm-size=2g \
     -u "$(id -u):$(id -g)" \
     -e HOME=/tmp \

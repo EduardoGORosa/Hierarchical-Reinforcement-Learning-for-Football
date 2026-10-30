@@ -162,8 +162,10 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
         rng: np.random.Generator | None = None,
         end_value: Callable[[np.ndarray], float] | None = None,
         end_value_weight: float = 1.0,
+        z_policy: Callable[[np.ndarray], int] | None = None,
     ) -> None:
         super().__init__(env)
+        self.z_policy = z_policy  # --z-from: a trained mu picks z instead of the uniform draw (variation 6)
         assert mix in REWARD_MIXES
         base = env.observation_space
         assert isinstance(base, gymnasium.spaces.Box), (
@@ -179,9 +181,11 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
         self.log = []
         self.end_value, self.end_value_weight = end_value, end_value_weight
 
-    def _start(self, raw: RawObs) -> None:
+    def _start(self, raw: RawObs, base_obs: np.ndarray | None = None) -> None:
         from hrl import options as O
-        if O.INITIATION:  # --initiation: draw only options whose I(s) holds; all of them if none does
+        if self.z_policy is not None and base_obs is not None:
+            z = int(self.z_policy(base_obs))
+        elif O.INITIATION:  # --initiation: draw only options whose I(s) holds; all of them if none does
             ok = [o.z for o in OPTIONS if o.initiation(raw)]
             z = int(self.rng.choice(ok)) if ok else int(self.rng.integers(N_OPTIONS))
         else:
@@ -195,7 +199,7 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
         base_obs, info = self.env.reset(**kwargs)
         self.t = 0
         self.prev_raw = raw_frame(self.env)
-        self._start(self.prev_raw)
+        self._start(self.prev_raw, base_obs)
         return self._obs(base_obs), info
 
     def step(self, action: int) -> StepResult:
@@ -219,7 +223,7 @@ class OptionLearningEnv(gymnasium.Wrapper[np.ndarray, int, np.ndarray, int]):
         if end:
             self.log.append((OPTIONS[self.start.z].name, end, self.t - self.start.step))
             if not (terminated or truncated):
-                self._start(raw)
+                self._start(raw, base_obs)
 
         r_combined = combine_rewards(r_env, r_o, self.mix, self.weight)
         if end and self.end_value is not None and not (terminated or truncated):

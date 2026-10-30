@@ -156,7 +156,7 @@ def _option_return_classes():
 def main() -> int:
     p = build_parser()
     p.add_argument("phase", choices=["options", "mu"])
-    p.add_argument("--option-set", default="zones", choices=["zones", "actions"])
+    p.add_argument("--option-set", default="zones", choices=["zones", "actions", "targeted"])
     p.add_argument("--reward-mix", default="both", choices=["option", "both", "env"])
     p.add_argument("--option-reward-weight", type=float, default=0.1)
     p.add_argument("--termination", default="clock", choices=["clock", "geometric"])
@@ -177,6 +177,9 @@ def main() -> int:
                    help="phase mu: mu sees a style w (Dirichlet per episode) and earns --style-bonus x w[z] when z is reached")
     p.add_argument("--style-bonus", type=float, default=0.3)
     p.add_argument("--style-alpha", type=float, default=1.0, help="Dirichlet concentration for w (1 = uniform over styles)")
+    p.add_argument("--z-from", default=None,
+                   help="phase options: a trained options-only mu zip picks each z, instead of uniform "
+                        "(joint fine-tune of pi under the mu that uses it; variation 6)")
     args = p.parse_args()
     assert not (args.initiation and args.phase == "mu" and not args.with_primitives), \
         "--initiation in phase mu needs --with-primitives: 3v1 starts on a loose ball, where no option can start"
@@ -204,7 +207,12 @@ def main() -> int:
                 base = GFootballEnv(env_name=args.level, representation=args.representation, rewards=args.rewards)
             rng = np.random.default_rng(args.seed + rank)
             if args.phase == "options":
-                end_value = None
+                end_value, z_policy = None, None
+                if args.z_from:
+                    mu_z = PPO.load(args.z_from, device="cpu")
+
+                    def z_policy(o):
+                        return int(mu_z.predict(o, deterministic=False)[0])
                 if args.end_value_from:
                     import torch
                     mu = PPO.load(args.end_value_from, device="cpu")
@@ -213,7 +221,8 @@ def main() -> int:
                         with torch.no_grad():
                             return float(mu.policy.predict_values(torch.as_tensor(o[None], dtype=torch.float32))[0, 0])
                 env = OptionLearningEnv(base, args.reward_mix, args.option_reward_weight, args.termination, rng,
-                                        end_value=end_value, end_value_weight=args.end_value_weight)
+                                        end_value=end_value, end_value_weight=args.end_value_weight,
+                                        z_policy=z_policy)
             else:
                 pi = PPO.load(args.option_policy, device="cpu")
                 env = SMDPEnv(base, lambda o: int(pi.predict(o, deterministic=False)[0]), args.gamma,
@@ -225,10 +234,36 @@ def main() -> int:
             return env
         return _init
 
+    def make_team_env(rank):
+        """--agents > 1, phase mu: TeamSMDPEnv over the frozen multi-agent option policy."""
+        def _init():
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from hrl.options import use_option_set
+            use_option_set(args.option_set)
+            from hrl.multiagent import MultiAgentGame, TeamSMDPEnv
+            pi = PPO.load(args.option_policy, device="cpu")
+            env = TeamSMDPEnv(MultiAgentGame(args.level, args.agents), lambda o: pi.predict(o, deterministic=False)[0],
+                              args.gamma)
+            env.reset(seed=args.seed + rank)
+            return env
+        return _init
+
+    def team_option_wrap(game, rank):
+        from hrl.options import use_option_set
+        use_option_set(args.option_set)
+        from hrl.multiagent import TeamOptionLearningEnv
+        return TeamOptionLearningEnv(game, args.reward_mix, args.option_reward_weight,
+                                     np.random.default_rng(args.seed + rank))
+
     # Phase mu: also log the game's own reward per episode, so goals stay countable when a
     # deliberation cost makes the monitored reward negative.
-    venv = VecMonitor(SubprocVecEnv([make_env(i) for i in range(args.n_envs)], start_method="spawn"),
-                      filename=str(run_dir / "monitor.csv"),
+    if args.agents > 1 and args.phase == "options":
+        from hrl.multiagent import make_games
+        games = make_games(args.level, args.agents, args.n_envs, args.seed, team_option_wrap)
+    else:
+        games = SubprocVecEnv([(make_team_env if args.agents > 1 else make_env)(i) for i in range(args.n_envs)],
+                              start_method="spawn")
+    venv = VecMonitor(games, filename=str(run_dir / "monitor.csv"),
                       info_keywords=("episode_env_reward",) if args.phase == "mu" else ())
     kwargs, callbacks = _ppo_kwargs(args), None
     if args.phase == "options" and args.option_returns:
@@ -247,7 +282,8 @@ def main() -> int:
         # A cost from scratch collapses mu before it learns to score (dense cost, sparse goals).
         model.set_parameters(args.init_from, exact_match=True, device="cpu")
     try:
-        model.learn(total_timesteps=args.timesteps, callback=callbacks)
+        model.learn(total_timesteps=args.timesteps * (args.agents if args.phase == "options" else 1),
+                    callback=callbacks)
     finally:
         model.save(str(run_dir / "final_model"))
         venv.close()

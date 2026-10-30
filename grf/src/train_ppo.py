@@ -60,6 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
                      help="save every N steps (0 = only at the end)")
     run.add_argument("--init-from", default=None,
                      help="start from this model zip's weights instead of random ones (continue a run)")
+
+    var = p.add_argument_group("variations (2026-10-29 quick tests)")
+    var.add_argument("--subgoal-bonus", type=float, default=0.0,
+                     help="+W per pass / carry past the defender / shot: the options' subgoals as flat shaping "
+                          "(hrl.match_stats.SubgoalBonus)")
+    var.add_argument("--agents", type=int, default=1,
+                     help="learning agents per game (>1: hrl.multiagent, one shared network, IPPO). "
+                          "--timesteps then counts GAME steps; SB3's own counter is agent-steps")
     return p
 
 
@@ -93,6 +101,12 @@ def main() -> int:
 
     def make_env(rank: int):
         def _init():
+            if args.subgoal_bonus:
+                from hrl.match_stats import SubgoalBonus
+                e = SubgoalBonus(GFootballEnv(env_name=args.level, representation=args.representation,
+                                              rewards=args.rewards), args.subgoal_bonus)
+                e.reset(seed=args.seed + rank)
+                return e
             e = GFootballEnv(
                 env_name=args.level,
                 representation=args.representation,
@@ -108,10 +122,15 @@ def main() -> int:
 
     # 'spawn' rather than 'fork': each worker loads the gfootball C++/SDL engine,
     # and forking a parent that has already initialised it is not safe.
-    venv = SubprocVecEnv([make_env(i) for i in range(args.n_envs)], start_method="spawn")
-    venv = VecMonitor(venv, filename=str(run_dir / "monitor.csv"))
+    if args.agents > 1:
+        from hrl.multiagent import make_games
+        venv = make_games(args.level, args.agents, args.n_envs, args.seed)
+    else:
+        venv = SubprocVecEnv([make_env(i) for i in range(args.n_envs)], start_method="spawn")
+    venv = VecMonitor(venv, filename=str(run_dir / "monitor.csv"),
+                      info_keywords=("episode_goal",) if args.subgoal_bonus else ())
 
-    rollout = args.n_envs * args.n_steps
+    rollout = args.n_envs * args.agents * args.n_steps
     if rollout % args.n_minibatches != 0:
         print(f"[warn] rollout {rollout} not divisible by {args.n_minibatches} minibatches", file=sys.stderr)
     batch_size = max(1, rollout // args.n_minibatches)
@@ -152,7 +171,7 @@ def main() -> int:
         ))
 
     try:
-        model.learn(total_timesteps=args.timesteps, callback=callbacks or None, progress_bar=False)
+        model.learn(total_timesteps=args.timesteps * args.agents, callback=callbacks or None, progress_bar=False)
     finally:
         model.save(str(run_dir / "final_model"))
         venv.close()
