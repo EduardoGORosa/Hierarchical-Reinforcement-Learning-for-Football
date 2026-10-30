@@ -103,16 +103,17 @@ def _smdp_classes():
         """Copies info["tau"] into the buffer slot about to be written.
         (SB3 2.4 calls on_step() just before rollout_buffer.add().)"""
 
-        def __init__(self, max_env_steps: int = 0):
+        def __init__(self, max_env_steps: int = 0, slots_per_game: int = 1):
             super().__init__()
             self.env_steps = 0
             self.max_env_steps = max_env_steps
+            self.slots_per_game = slots_per_game  # --ma-design agents: each game's decision fills one slot per agent
 
         def _on_step(self) -> bool:
             buf = self.model.rollout_buffer
             taus = [int(info["tau"]) for info in self.locals["infos"]]
             buf.taus[buf.pos] = taus
-            self.env_steps += sum(taus)
+            self.env_steps += sum(taus) // self.slots_per_game
             self.logger.record("hrl/env_steps", self.env_steps)
             # mu's budget is counted in decisions; this stops it on an env-step budget instead.
             return not (self.max_env_steps and self.env_steps >= self.max_env_steps)
@@ -156,7 +157,7 @@ def _option_return_classes():
 def main() -> int:
     p = build_parser()
     p.add_argument("phase", choices=["options", "mu"])
-    p.add_argument("--option-set", default="zones", choices=["zones", "actions", "targeted"])
+    p.add_argument("--option-set", default="zones", choices=["zones", "actions", "targeted", "plays", "agent"])
     p.add_argument("--reward-mix", default="both", choices=["option", "both", "env"])
     p.add_argument("--option-reward-weight", type=float, default=0.1)
     p.add_argument("--termination", default="clock", choices=["clock", "geometric"])
@@ -180,7 +181,14 @@ def main() -> int:
     p.add_argument("--z-from", default=None,
                    help="phase options: a trained options-only mu zip picks each z, instead of uniform "
                         "(joint fine-tune of pi under the mu that uses it; variation 6)")
+    p.add_argument("--ma-design", default="team", choices=["team", "roles", "agents"],
+                   help="--agents > 1: team = one team z, agent ids (first version); roles = design A, one team "
+                        "play, agents see their role; agents = design B, each agent's own option and mu")
     args = p.parse_args()
+    if args.agents > 1 and args.ma_design == "roles":
+        assert args.option_set == "plays", "--ma-design roles uses --option-set plays"
+    if args.agents > 1 and args.ma_design == "agents":
+        assert args.option_set == "agent", "--ma-design agents uses --option-set agent"
     assert not (args.initiation and args.phase == "mu" and not args.with_primitives), \
         "--initiation in phase mu needs --with-primitives: 3v1 starts on a loose ball, where no option can start"
 
@@ -243,7 +251,7 @@ def main() -> int:
             from hrl.multiagent import MultiAgentGame, TeamSMDPEnv
             pi = PPO.load(args.option_policy, device="cpu")
             env = TeamSMDPEnv(MultiAgentGame(args.level, args.agents), lambda o: pi.predict(o, deterministic=False)[0],
-                              args.gamma)
+                              args.gamma, with_roles=args.ma_design == "roles")
             env.reset(seed=args.seed + rank)
             return env
         return _init
@@ -251,20 +259,40 @@ def main() -> int:
     def team_option_wrap(game, rank):
         from hrl.options import use_option_set
         use_option_set(args.option_set)
-        from hrl.multiagent import TeamOptionLearningEnv
-        return TeamOptionLearningEnv(game, args.reward_mix, args.option_reward_weight,
-                                     np.random.default_rng(args.seed + rank))
+        from hrl.multiagent import AgentOptionLearningEnv, TeamOptionLearningEnv
+        rng = np.random.default_rng(args.seed + rank)
+        if args.ma_design == "agents":
+            return AgentOptionLearningEnv(game, args.reward_mix, args.option_reward_weight, rng)
+        return TeamOptionLearningEnv(game, args.reward_mix, args.option_reward_weight, rng,
+                                     with_roles=args.ma_design == "roles")
+
+    def agent_mu_wrap(game, rank):
+        from hrl.options import use_option_set
+        use_option_set(args.option_set)
+        from hrl.multiagent import AgentSMDPEnv
+        pi = PPO.load(args.option_policy, device="cpu")
+        return AgentSMDPEnv(game, lambda o: pi.predict(o, deterministic=False)[0], args.gamma)
 
     # Phase mu: also log the game's own reward per episode, so goals stay countable when a
     # deliberation cost makes the monitored reward negative.
     if args.agents > 1 and args.phase == "options":
         from hrl.multiagent import make_games
-        games = make_games(args.level, args.agents, args.n_envs, args.seed, team_option_wrap)
+        # design A carries roles instead of ids in every row
+        games = make_games(args.level, args.agents, args.n_envs, args.seed, team_option_wrap,
+                           ids=args.ma_design != "roles")
+    elif args.agents > 1 and args.ma_design == "agents":  # design B, phase mu: one slot per agent's mu
+        from hrl.multiagent import make_games
+        games = make_games(args.level, args.agents, args.n_envs, args.seed, agent_mu_wrap)
     else:
         games = SubprocVecEnv([(make_team_env if args.agents > 1 else make_env)(i) for i in range(args.n_envs)],
                               start_method="spawn")
-    venv = VecMonitor(games, filename=str(run_dir / "monitor.csv"),
-                      info_keywords=("episode_env_reward",) if args.phase == "mu" else ())
+    keywords = ("episode_env_reward",) if args.phase == "mu" else ()
+    if args.agents > 1 and args.phase == "options":  # how often each team option started and reached its subgoal
+        from hrl.options import use_option_set
+        use_option_set(args.option_set)
+        from hrl.multiagent import option_keywords
+        keywords = option_keywords()
+    venv = VecMonitor(games, filename=str(run_dir / "monitor.csv"), info_keywords=keywords)
     kwargs, callbacks = _ppo_kwargs(args), None
     if args.phase == "options" and args.option_returns:
         OptionReturnBuffer, RecordOptionEnd = _option_return_classes()
@@ -274,7 +302,7 @@ def main() -> int:
         assert args.option_policy, "--option-policy is required for phase mu"
         SMDPRolloutBuffer, RecordTau = _smdp_classes()
         kwargs["rollout_buffer_class"] = SMDPRolloutBuffer
-        callbacks = [RecordTau(args.max_env_steps)]
+        callbacks = [RecordTau(args.max_env_steps, args.agents if args.ma_design == "agents" else 1)]
 
     model = PPO("MlpPolicy", venv, tensorboard_log=str(run_dir / "tb"), **kwargs)
     if args.init_from:

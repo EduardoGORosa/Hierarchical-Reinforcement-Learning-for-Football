@@ -142,12 +142,32 @@ TARGETED_OPTIONS = (  # variation 2 (2026-10-29): dribble split by where it carr
     Option(4, "carry_box", subgoal="carry_to_box", horizon=ACTION_HORIZON),
     Option(5, "shoot", subgoal="shot_released", horizon=ACTION_HORIZON),
 )
+# Multi-agent option sets (hrl/multiagent.py). Both are tested on raw frames like the others.
+PLAY_OPTIONS = (  # design A: one play for the whole team; every agent also sees its role
+    Option(0, "carry", subgoal="beat_defender", horizon=ACTION_HORIZON),
+    Option(1, "give_and_go", subgoal="give_and_go", horizon=30),
+    Option(2, "through_ball", subgoal="through_ball", horizon=ACTION_HORIZON),
+    Option(3, "switch", subgoal="switch_play", horizon=ACTION_HORIZON),
+    Option(4, "shoot", subgoal="shot_released", horizon=ACTION_HORIZON),
+)
+AGENT_OPTIONS = (  # design B: each agent's own option; the first three need the ball, the last two don't
+    Option(0, "carry", subgoal="agent_carry", horizon=ACTION_HORIZON),
+    Option(1, "pass", subgoal="agent_pass", horizon=ACTION_HORIZON),
+    Option(2, "shoot", subgoal="agent_shoot", horizon=ACTION_HORIZON),
+    Option(3, "get_open", subgoal="get_open", horizon=ACTION_HORIZON),
+    Option(4, "receive", subgoal="receive", horizon=ACTION_HORIZON),
+)
+OPEN_AHEAD_M = 3.0  # get_open: at least this far ahead of the ball ...
+OPEN_SPACE_M = 6.0  # ... with no opponent nearer than this
+SWITCH_M = 15.0  # switch_play: the receiver is at least this far across from where the ball started
 OPTION_SETS: dict[
     OptionSetName, tuple[tuple[Option, ...], int]
 ] = {  # name -> (options, H_o)
     "zones": (ZONE_OPTIONS, HORIZON),
     "actions": (ACTION_OPTIONS, ACTION_HORIZON),
     "targeted": (TARGETED_OPTIONS, ACTION_HORIZON),
+    "plays": (PLAY_OPTIONS, 30),
+    "agent": (AGENT_OPTIONS, ACTION_HORIZON),
 }
 OPTIONS = ZONE_OPTIONS
 SUBGOALS = tuple(o.name for o in OPTIONS)
@@ -186,6 +206,8 @@ class OptionStart:
     raw: RawObs | None = (
         None  # the whole raw frame when it started: pass and dribble read it
     )
+    player: int | None = None  # "agent" set: the left_team index of the agent running this option
+    memo: dict | None = None  # "plays" set: what has happened since the start (give_and_go's first pass)
 
 
 # --- node 30: the subgoals, i.e. what each option reward pays for ------------
@@ -360,6 +382,69 @@ def carry_to_box(start_obs: RawObs, obs: RawObs) -> bool:
     return carrier(start_obs) == carrier(obs) and ball_in_box(obs)
 
 
+# --- multi-agent subgoals (design A: plays, design B: agent options) ------------------
+
+
+def _passed(start_obs: RawObs, obs: RawObs) -> bool:
+    """We own the ball and another of our players has it than at the start."""
+    return completed_pass(start_obs, obs)
+
+
+def give_and_go(start: OptionStart, obs: RawObs) -> bool:
+    """The starting carrier passes, and the ball comes back to him: owner A -> B -> A."""
+    memo = start.memo if start.memo is not None else {}
+    start.memo = memo
+    a = carrier(start.raw)
+    if we_own_ball(obs) and obs["ball_owned_player"] != a:
+        memo["passed"] = True
+    return bool(memo.get("passed")) and we_own_ball(obs) and obs["ball_owned_player"] == a
+
+
+def through_ball(start_obs: RawObs, obs: RawObs) -> bool:
+    """A pass is completed to a player who is beyond the field defender when he receives it."""
+    d = defender_to_beat(start_obs)
+    return _passed(start_obs, obs) and d != -1 and obs["ball"][0] > obs["right_team"][d][0]
+
+
+def switch_play(start_obs: RawObs, obs: RawObs) -> bool:
+    """A pass is completed to a player at least SWITCH_M across the pitch from where the ball started."""
+    return _passed(start_obs, obs) and abs(obs["ball"][1] - start_obs["ball"][1]) * Y_METRES >= SWITCH_M
+
+
+def agent_carry(start: OptionStart, obs: RawObs) -> bool:
+    """This agent has the ball and has got it past the field defender."""
+    d = defender_to_beat(start.raw)
+    return (we_own_ball(obs) and obs["ball_owned_player"] == start.player and d != -1
+            and obs["ball"][0] > obs["right_team"][d][0])
+
+
+def agent_pass(start: OptionStart, obs: RawObs) -> bool:
+    """This agent had the ball at the start and another of our players has it now."""
+    return carrier(start.raw) == start.player and we_own_ball(obs) and obs["ball_owned_player"] != start.player
+
+
+def agent_shoot(start: OptionStart, prev_obs: RawObs, obs: RawObs) -> bool:
+    """The ball left THIS agent's foot towards goal."""
+    return prev_obs["ball_owned_player"] == start.player and shot_released(prev_obs, obs)
+
+
+def get_open(start: OptionStart, obs: RawObs) -> bool:
+    """We have the ball, this agent doesn't, he is OPEN_AHEAD_M ahead of it, and no opponent is
+    within OPEN_SPACE_M of him: a target for a forward pass."""
+    p = start.player
+    if not we_own_ball(obs) or obs["ball_owned_player"] == p:
+        return False
+    me = obs["left_team"][p]
+    if (me[0] - obs["ball"][0]) * X_METRES < OPEN_AHEAD_M:
+        return False
+    return min(closeness_to_ball(o, me) for o in obs["right_team"]) >= OPEN_SPACE_M
+
+
+def receive(start: OptionStart, obs: RawObs) -> bool:
+    """This agent did not have the ball at the start and has it now, from a teammate."""
+    return carrier(start.raw) != start.player and we_own_ball(obs) and obs["ball_owned_player"] == start.player
+
+
 def shot_released(prev_obs: RawObs, obs: RawObs) -> bool:
     """is_shot read from the ball's flight only (no action): the ball has to leave the foot.
     Provided. With the button counted, holding `shot` while still on the ball paid every step:
@@ -401,6 +486,22 @@ def subgoal_reached(
         case "carry_to_box":
             assert start.raw is not None
             return carry_to_box(start.raw, obs)
+        case "give_and_go":
+            return give_and_go(start, obs)
+        case "through_ball":
+            return through_ball(start.raw, obs)
+        case "switch_play":
+            return switch_play(start.raw, obs)
+        case "agent_carry":
+            return agent_carry(start, obs)
+        case "agent_pass":
+            return agent_pass(start, obs)
+        case "agent_shoot":
+            return agent_shoot(start, prev_obs, obs)
+        case "get_open":
+            return get_open(start, obs)
+        case "receive":
+            return receive(start, obs)
 
 
 def option_reward(

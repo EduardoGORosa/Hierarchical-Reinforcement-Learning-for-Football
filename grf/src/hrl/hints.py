@@ -15,10 +15,11 @@ OptionEnd = Literal["reached", "failed", "timeout", "interrupted", "primitive", 
 ActionKind = Literal["option", "primitive"]
 SubgoalKind = Literal[
     "forward_in_lane", "ball_in_box", "is_shot", "keep_ball", "completed_pass", "beat_defender",
-    "shot_released", "carry_to_lane", "carry_to_box",
+    "shot_released", "carry_to_lane", "carry_to_box", "give_and_go", "through_ball", "switch_play",
+    "agent_carry", "agent_pass", "agent_shoot", "get_open", "receive",
 ]
 """Which test ends an option as reached: the options.py function of the same name."""
-OptionSetName = Literal["zones", "actions", "targeted"]
+OptionSetName = Literal["zones", "actions", "targeted", "plays", "agent"]
 """Which options exist (options.OPTION_SETS): "zones" the six pitch-zone options (nodes 30-37),
 "actions" pass / dribble / shoot (node 37a)."""
 

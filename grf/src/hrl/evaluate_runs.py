@@ -71,10 +71,13 @@ def make_env(spec: list[str], level: str, seed: int):
             from hrl.options import use_option_set
             ocfg = json.loads((RUNS / spec[2] / "config.json").read_text())
             use_option_set(ocfg.get("option_set", "actions"))
-            from hrl.multiagent import MultiAgentGame, TeamSMDPEnv
+            from hrl.multiagent import AgentSMDPEnv, MultiAgentGame, TeamSMDPEnv
             pi = PPO.load(str(RUNS / spec[2] / "final_model.zip"), device="cpu")
-            env = TeamSMDPEnv(MatchStats(MultiAgentGame(level, ocfg.get("agents", 3))),
-                              lambda o: pi.predict(o, deterministic=False)[0], 0.993)
+            game = MatchStats(MultiAgentGame(level, ocfg.get("agents", 3)))
+            policy = lambda o: pi.predict(o, deterministic=False)[0]  # noqa: E731
+            design = ocfg.get("ma_design", "team")
+            env = (AgentSMDPEnv(game, policy, 0.993) if design == "agents"
+                   else TeamSMDPEnv(game, policy, 0.993, with_roles=design == "roles"))
         else:
             raise ValueError(kind)
         env.reset(seed=seed)
@@ -98,7 +101,9 @@ def evaluate(spec: list[str], level: str, episodes: int, seed: int, tilt=None, n
     venv = SubprocVecEnv([make_env(spec, level, seed * 100 + i) for i in range(n_envs)], start_method="spawn")
     obs = venv.reset()
     rows, picks, steps = [], Counter(), Counter()
-    ma = kind == "ma_flat"
+    # one decision per agent: the flat multi-agent team, and design B's per-agent mu
+    ma = kind == "ma_flat" or (kind == "ma_hrl" and json.loads(
+        (RUNS / spec[2] / "config.json").read_text()).get("ma_design") == "agents")
     while len(rows) < episodes:
         if kind == "const":
             act = np.full(n_envs, int(spec[2]))
@@ -117,10 +122,10 @@ def evaluate(spec: list[str], level: str, episodes: int, seed: int, tilt=None, n
         obs, r, done, infos = venv.step(act)
         for i, info in enumerate(infos):
             if kind in ("hrl", "const", "ma_hrl"):
-                a = int(np.asarray(act[i]).ravel()[0])
-                name = OPTIONS[a].name if a < len(OPTIONS) else "primitive"
-                picks[name] += 1
-                steps[name] += info.get("tau", 1)
+                for a in np.asarray(act[i]).ravel():  # one choice, or one per agent (design B)
+                    name = OPTIONS[int(a)].name if a < len(OPTIONS) else "primitive"
+                    picks[name] += 1
+                    steps[name] += info.get("tau", 1)
             if done[i] and "match" in info and len(rows) < episodes:
                 rows.append(info["match"])
     venv.close()
