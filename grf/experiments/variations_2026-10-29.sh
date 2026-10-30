@@ -5,7 +5,8 @@
 #
 #   lane E  evaluations of existing models (starts at once, 4 workers)
 #   lane A  training: plateau fixes (V6), targeted options (V2), scenario transfer (V4)   after the main run
-#   lane B  training: subgoal shaping (V5), CF roles (V1), multi-agent (V4)               after the main run
+#   lane B  training: subgoal shaping (V5), CF roles (V1)                                 after the main run
+#   lane C  training: multi-agent (V4)                                                    after the main run
 set -uo pipefail
 GRF="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MAIN=${MAIN_PROGRESS:-/home/dudu/.claude/jobs/bc964cef/tmp/overnight/main_progress.txt}
@@ -58,7 +59,7 @@ mu_cont() {  # mu from m10_mu_s0 for 1M more env steps on options $2, extra flag
 }
 
 laneA() {
-  wait_main
+  [ -n "${A_NOW:-}" ] || wait_main   # A_NOW=1: start now (one training lane fits next to the main run: ~4.3 GB each)
   # V6: plateau. Control, then more exploration, then pi fine-tuned under the mu that uses it
   mu_cont v6_ctrl_s0 p3_opt_s0
   mu_cont v6_hient_s0 p3_opt_s0 --ent-coef 0.03 --lr 0.001 --clip-range 0.2
@@ -92,6 +93,12 @@ laneB() {
   run v1_cf_flat_train_s0 ./run.sh train --level cf_3_vs_1_with_keeper --rewards scoring --timesteps 2000000 \
     --seed 0 --run-name v1_cf_flat_train_s0
   ev v1_cf_flat_train_s0 --level cf_3_vs_1_with_keeper --agent flat:v1_cf_flat_train_s0
+  stamp "lane B finished"
+}
+
+LANES=${LANES:-E A B}  # e.g. LANES="A B" A_NOW=1 to rerun only the training lanes, A without waiting
+laneC() {  # split out of lane B once the main run had finished (2026-10-30 03:20)
+  wait_main
   # V4: three learning agents, no AI teammates
   run v4_ma_flat_s0 ./run.sh train --level ma_3_vs_1_with_keeper --rewards scoring --agents 3 --timesteps 3000000 \
     --seed 0 --run-name v4_ma_flat_s0
@@ -102,9 +109,10 @@ laneB() {
     --option-set actions --timesteps 9000000 --max-env-steps 2000000 --seed 0 --run-name v4_ma_mu_s0 \
     --option-policy /work/runs/v4_ma_opt_s0/final_model.zip
   ev v4_ma_mu_s0 --level ma_3_vs_1_with_keeper --agent ma_hrl:v4_ma_mu_s0:v4_ma_opt_s0
-  stamp "lane B finished"
+  stamp "lane C finished"
 }
 
-stamp "variations start"
-laneE & laneA & laneB & wait
+stamp "variations start (lanes: $LANES)"
+for l in $LANES; do "lane$l" & done
+wait
 stamp "variations finished"
